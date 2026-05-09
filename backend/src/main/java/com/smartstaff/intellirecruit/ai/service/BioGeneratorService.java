@@ -1,13 +1,17 @@
 package com.smartstaff.intellirecruit.ai.service;
 
 import com.smartstaff.intellirecruit.ai.dto.AiResponse;
-import com.smartstaff.intellirecruit.entity.AiGeneratedContent;
 import com.smartstaff.intellirecruit.entity.Candidate;
+import com.smartstaff.intellirecruit.entity.User;
 import com.smartstaff.intellirecruit.exception.ResourceNotFoundException;
+import com.smartstaff.intellirecruit.kafka.event.AiEventBuilder;
+import com.smartstaff.intellirecruit.kafka.producer.AiEventProducer;
 import com.smartstaff.intellirecruit.redis.AiCacheService;
 import com.smartstaff.intellirecruit.repository.CandidateRepository;
+import com.smartstaff.intellirecruit.repository.UserRepository;
 import com.smartstaff.intellirecruit.service.AiContentService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -17,42 +21,66 @@ public class BioGeneratorService {
     @Autowired
     private CandidateRepository candidateRepository;
     @Autowired
+    private UserRepository userRepository;
+    @Autowired
     private AiContentService aiContentService;
     @Autowired
     private AiCacheService aiCacheService;
+    @Autowired
+    private AiEventProducer aiEventProducer;
 
-    public AiResponse generateBio(Long candidateId, String customInstructions) {
+    public AiResponse generateBio(String email, String customInstructions) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new ResourceNotFoundException("User", email));
+
+        Candidate candidate = candidateRepository.findByUserId(user.getId())
+                .orElseThrow(() -> new ResourceNotFoundException("User Candidate", user.getId()));
+
         // 1. Check Redis cache first
-        String cached = aiCacheService.getCachedResponse("BIO", candidateId);
+        String cached = aiCacheService.getCachedResponse("BIO", candidate.getId());
         if (cached != null && customInstructions == null) {
             return AiResponse.builder()
                     .content(cached)
                     .type("BIO")
-                    .entityId(candidateId)
+                    .entityId(candidate.getId())
                     .saved(false) // came from cache, not freshly generated
                     .build();
         }
 
         // 2. Cache miss — call Gemini
-        Candidate candidate = candidateRepository.findById(candidateId)
-                .orElseThrow(() -> new ResourceNotFoundException("Candidate", candidateId));
-
         String prompt = buildPrompt(candidate, customInstructions);
         String generatedBio = geminiAiService.generate(prompt);
 
         // 3. Store in Redis cache
-        aiCacheService.cacheResponse("BIO", candidateId, generatedBio);
+        aiCacheService.cacheResponse("BIO", candidate.getId(), generatedBio);
 
-        aiContentService.save(
-                AiGeneratedContent.ContentType.BIO,
-                generatedBio,
-                candidateId
+        // 5. Get current logged-in user email
+        String triggeredBy = SecurityContextHolder.getContext()
+                .getAuthentication().getName();
+
+        // 6. Publish to Kafka — consumer will save to DB + send email
+        //    If Kafka is down, fallback handles it synchronously
+        aiEventProducer.publishAiGeneratedEvent(
+                AiEventBuilder.build(
+                        "BIO",
+                        candidate.getId(),
+                        generatedBio,
+                        triggeredBy,
+                        candidate.getUser().getEmail(),   // notify candidate
+                        candidate.getUser().getName()
+                )
         );
+
+//        aiContentService.save(
+//                AiGeneratedContent.ContentType.BIO,
+//                generatedBio,
+//                candidateId
+//        );
 
         return AiResponse.builder()
                 .content(generatedBio)
                 .type("BIO")
-                .entityId(candidateId)
+                .entityId(candidate.getId())
                 .saved(true)
                 .build();
     }

@@ -1,0 +1,17 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    path {
+      stroke: #000000; /* light mode: black hexagon */
+    }
+    @media (prefers-color-scheme: dark) {
+      path {
+        stroke: #ffffff; /* dark mode: white hexagon */
+      }
+    }
+  </style>
+  <!-- Transparent background, hexagon outline only -->
+  <path d="M32 10L52 21.5V42.5L32 54L12 42.5V21.5L32 10Z"
+        stroke-width="4"
+        stroke-linejoin="round"
+        fill="none"/>
+</svg>

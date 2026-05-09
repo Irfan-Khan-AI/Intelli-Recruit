@@ -3,11 +3,16 @@ package com.smartstaff.intellirecruit.ai.service;
 import com.smartstaff.intellirecruit.ai.dto.AiResponse;
 import com.smartstaff.intellirecruit.entity.AiGeneratedContent;
 import com.smartstaff.intellirecruit.entity.Candidate;
+import com.smartstaff.intellirecruit.entity.User;
 import com.smartstaff.intellirecruit.exception.ResourceNotFoundException;
+import com.smartstaff.intellirecruit.kafka.event.AiEventBuilder;
+import com.smartstaff.intellirecruit.kafka.producer.AiEventProducer;
 import com.smartstaff.intellirecruit.redis.AiCacheService;
 import com.smartstaff.intellirecruit.repository.CandidateRepository;
+import com.smartstaff.intellirecruit.repository.UserRepository;
 import com.smartstaff.intellirecruit.service.AiContentService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -20,23 +25,30 @@ public class BioFilterService {
     private AiContentService aiContentService;
     @Autowired
     private AiCacheService aiCacheService;
+    @Autowired
+    private AiEventProducer aiEventProducer;
+    @Autowired
+    private UserRepository userRepository;
 
-    public AiResponse filterBio(Long candidateId, String agencyPolicies) {
+    public AiResponse filterBio(String email, String agencyPolicies) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new ResourceNotFoundException("User", email));
+
+        Candidate candidate = candidateRepository.findByUserId(user.getId())
+                .orElseThrow(() -> new ResourceNotFoundException("User Candidate", user.getId()));
+
         // 1. Check Redis cache first
-        String cached = aiCacheService.getCachedResponse("FILTERED_BIO", candidateId);
+        String cached = aiCacheService.getCachedResponse("FILTERED_BIO", candidate.getId());
         if (cached != null && agencyPolicies == null) {
             return AiResponse.builder()
                     .content(cached)
                     .type("FILTERED_BIO")
-                    .entityId(candidateId)
+                    .entityId(candidate.getId())
                     .saved(false) // came from cache, not freshly generated
                     .build();
         }
 
         // 2. Cache miss — call Gemini
-        Candidate candidate = candidateRepository.findById(candidateId)
-                .orElseThrow(() -> new ResourceNotFoundException("Candidate", candidateId));
-
         if (candidate.getBio() == null || candidate.getBio().isBlank()) {
             throw new IllegalArgumentException("Candidate has no bio to filter. Generate a bio first.");
         }
@@ -44,19 +56,40 @@ public class BioFilterService {
         String prompt = buildPrompt(candidate.getBio(), agencyPolicies);
         String filteredBio = geminiAiService.generate(prompt);
 
-        // 3. Store in Redis cache
-        aiCacheService.cacheResponse("FILTERED_BIO", candidateId, filteredBio);
+        // 3. Persist the filtered bio back to the candidate's profile in the DB
+        candidate.setBio(filteredBio);
+        candidateRepository.save(candidate);
 
-        aiContentService.save(
-                AiGeneratedContent.ContentType.FILTERED_BIO,
-                filteredBio,
-                candidateId
+        // 3a. Evict the stale BIO cache so the next bio-generation reads fresh data
+        aiCacheService.evictCache("BIO", candidate.getId());
+
+        // 4. Cache the new FILTERED_BIO result
+        aiCacheService.cacheResponse("FILTERED_BIO", candidate.getId(), filteredBio);
+
+        // Get current logged-in user
+        String triggeredBy = SecurityContextHolder.getContext()
+                .getAuthentication().getName();
+
+        // Publish to Kafka — no email notification for filter operations
+        aiEventProducer.publishAiGeneratedEvent(
+                AiEventBuilder.buildSilent(
+                        "FILTERED_BIO",
+                        candidate.getId(),
+                        filteredBio,
+                        triggeredBy
+                )
         );
+
+//        aiContentService.save(
+//                AiGeneratedContent.ContentType.FILTERED_BIO,
+//                filteredBio,
+//                candidateId
+//        );
 
         return AiResponse.builder()
                 .content(filteredBio)
                 .type("FILTERED_BIO")
-                .entityId(candidateId)
+                .entityId(candidate.getId())
                 .saved(true)
                 .build();
     }
